@@ -2,6 +2,12 @@
 name = "hnswx"
 version = "0.1.0"
 edition = "2024"
+authors = ["happyboy <superhappyboy1995@gmail.com>"]
+description = "A Rust implementation of the Hierarchical Navigable Small World (HNSW) algorithm. HNSW is an efficient approximate nearest neighbor search algorithm, particularly suitable for high-dimensional vector retrieval."
+keywords = ["hnsw"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/0xhappyboy/hnswx"
 
 [dependencies]
 rand = "0.8"
