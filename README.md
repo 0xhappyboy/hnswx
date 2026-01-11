@@ -5,7 +5,7 @@
 A Rust implementation of the Hierarchical Navigable Small World (HNSW) algorithm. HNSW is an efficient approximate nearest neighbor search algorithm, particularly suitable for high-dimensional vector retrieval.
 </h4>
 <p align="center">
-  <a href="https://github.com/0xhappyboy/hnswx/LICENSE"><img src="https://img.shields.io/badge/License-Apache2.0-d1d1f6.svg?style=flat&labelColor=1C2C2E&color=BEC5C9&logo=googledocs&label=license&logoColor=BEC5C9" alt="License"></a>
+  <a href="https://github.com/0xhappyboy/hnswx/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache2.0-d1d1f6.svg?style=flat&labelColor=1C2C2E&color=BEC5C9&logo=googledocs&label=license&logoColor=BEC5C9" alt="License"></a>
     <a href="https://crates.io/crates/hnswx">
 <img src="https://img.shields.io/badge/crates-hnswx-20B2AA.svg?style=flat&labelColor=0F1F2D&color=FFD700&logo=rust&logoColor=FFD700">
 </a>
