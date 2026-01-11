@@ -5,7 +5,7 @@
 一个用Rust实现的分层可导航小世界图算法(HNSW)算法库.HNSW是一种高效的近似最近邻搜索算法,特别适用于高维向量检索.
 </h4>
 <p align="center">
-  <a href="https://github.com/0xhappyboy/hnswx/LICENSE"><img src="https://img.shields.io/badge/License-Apache2.0-d1d1f6.svg?style=flat&labelColor=1C2C2E&color=BEC5C9&logo=googledocs&label=license&logoColor=BEC5C9" alt="License"></a>
+  <a href="https://github.com/0xhappyboy/hnswx/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache2.0-d1d1f6.svg?style=flat&labelColor=1C2C2E&color=BEC5C9&logo=googledocs&label=license&logoColor=BEC5C9" alt="License"></a>
     <a href="https://crates.io/crates/hnswx">
 <img src="https://img.shields.io/badge/crates-hnswx-20B2AA.svg?style=flat&labelColor=0F1F2D&color=FFD700&logo=rust&logoColor=FFD700">
 </a>
