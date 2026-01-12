@@ -12,6 +12,7 @@ repository = "https://github.com/0xhappyboy/hnswx"
 [dependencies]
 rand = "0.8"
 ordered-float = "3.0"
+hashbrown = "0.16.1"
 
 [dev-dependencies]
 rand = "0.8"
