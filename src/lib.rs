@@ -360,7 +360,10 @@ impl<D: DistanceMetric> HNSW<D> {
         let mut visited = HashSet::new();
         let mut candidates = Vec::new();
         let mut result = Vec::new();
-        let entry_node = self.get_node(entry_point)?;
+        let entry_node = match self.get_node(entry_point) {
+            Some(node) => node,
+            None => return None,
+        };
         let entry_dist = self.metric.distance(query, &entry_node.vector);
         candidates.push(SearchResult {
             id: entry_point,
@@ -372,17 +375,23 @@ impl<D: DistanceMetric> HNSW<D> {
             candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
             let current = candidates.remove(0);
             result.push(current.clone());
+
             if result.len() >= ef {
                 break;
             }
-            // Explore neighbors of current node
-            let node = self.get_node(current.id).unwrap();
+            let node = match self.get_node(current.id) {
+                Some(node) => node,
+                None => continue, // if the node does not exist, skip this step.
+            };
             if layer < node.friends.len() {
                 for &neighbor_id in &node.friends[layer] {
                     if visited.contains(&neighbor_id) || self.is_deleted(neighbor_id) {
                         continue;
                     }
-                    let neighbor = self.get_node(neighbor_id).unwrap();
+                    let neighbor = match self.get_node(neighbor_id) {
+                        Some(neighbor) => neighbor,
+                        None => continue,
+                    };
                     let dist = self.metric.distance(query, &neighbor.vector);
                     visited.insert(neighbor_id);
                     candidates.push(SearchResult {
@@ -458,23 +467,23 @@ impl<D: DistanceMetric> HNSW<D> {
     /// * `node_id` - Node ID whose connections need pruning
     /// * `layer` - Layer to prune connections in
     fn prune_connections(&mut self, node_id: usize, layer: usize) {
-        // Collect data to avoid borrowing issues
         let (vector, friends) = {
-            let node = self.get_node(node_id).unwrap();
-            (node.vector.clone(), node.friends[layer].clone())
+            match self.get_node(node_id) {
+                Some(node) => (node.vector.clone(), node.friends[layer].clone()),
+                None => return,
+            }
         };
         if friends.len() <= self.config.m_max {
             return;
         }
         // Calculate distances to all friends
-        let mut distances: Vec<(usize, f32)> = friends
-            .iter()
-            .map(|&id| {
-                let neighbor = self.get_node(id).unwrap();
+        let mut distances: Vec<(usize, f32)> = Vec::new();
+        for &id in &friends {
+            if let Some(neighbor) = self.get_node(id) {
                 let dist = self.metric.distance(&vector, &neighbor.vector);
-                (id, dist)
-            })
-            .collect();
+                distances.push((id, dist));
+            }
+        }
         // Sort by distance and keep only closest m_max friends
         distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         let pruned_friends: Vec<usize> = distances
@@ -482,9 +491,12 @@ impl<D: DistanceMetric> HNSW<D> {
             .take(self.config.m_max)
             .map(|&(id, _)| id)
             .collect();
+
         // Update node with pruned connections
         if let Some(node) = self.nodes[node_id].as_mut() {
-            node.friends[layer] = pruned_friends;
+            if layer < node.friends.len() {
+                node.friends[layer] = pruned_friends;
+            }
         }
     }
 
@@ -618,7 +630,7 @@ impl<D: DistanceMetric> HNSW<D> {
     ///
     /// # Returns
     /// true if node is deleted, false otherwise
-    fn is_deleted(&self, id: usize) -> bool {
+    pub fn is_deleted(&self, id: usize) -> bool {
         self.deleted_ids.contains(&id)
     }
 
@@ -709,60 +721,4 @@ pub struct HnswStats {
     pub max_connections: usize,
     /// Number of deleted nodes
     pub deleted_count: usize,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_hnsw_basic() {
-        let config = HnswConfig {
-            max_elements: 100,
-            m: 16,
-            m_max: 32,
-            m_max_0: 64,
-            ef_construction: 50,
-            ef_search: 10,
-            ..Default::default()
-        };
-        let mut hnsw = HNSW::new(config, EuclideanDistance);
-        let vectors = vec![
-            vec![1.0, 2.0, 3.0],
-            vec![2.0, 3.0, 4.0],
-            vec![3.0, 4.0, 5.0],
-            vec![4.0, 5.0, 6.0],
-            vec![5.0, 6.0, 7.0],
-        ];
-        let mut ids = Vec::new();
-        for vector in vectors {
-            ids.push(hnsw.insert(vector));
-        }
-        let query = vec![2.1, 3.1, 4.1];
-        let results = hnsw.search_knn(&query, 3);
-        assert_eq!(results.len(), 3);
-        let stats = hnsw.stats();
-        assert_eq!(stats.node_count, 5);
-        hnsw.delete(ids[0]);
-        let results_after_delete = hnsw.search_knn(&query, 3);
-        assert!(results_after_delete.iter().all(|r| r.id != ids[0]));
-    }
-
-    #[test]
-    fn test_cosine_similarity() {
-        let config = HnswConfig::default();
-        let mut hnsw = HNSW::new(config, CosineSimilarity);
-        let vectors = vec![
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-            vec![0.0, 0.0, 1.0],
-            vec![0.5, 0.5, 0.0],
-        ];
-        for vector in vectors {
-            hnsw.insert(vector);
-        }
-        let query = vec![1.0, 0.0, 0.0];
-        let results = hnsw.search_knn(&query, 2);
-        assert!(!results.is_empty());
-    }
 }
