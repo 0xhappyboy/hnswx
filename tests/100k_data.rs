@@ -15,6 +15,7 @@ mod querying_100k_data {
             m_max_0: 64,
             ef_construction: 200,
             ef_search: 50,
+            level_multiplier: 1.0 / 2.0_f64.ln(),
             ..Default::default()
         };
         let mut hnsw = HNSW::new(config, EuclideanDistance::new());

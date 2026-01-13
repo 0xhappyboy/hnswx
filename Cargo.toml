@@ -1,6 +1,6 @@
 [package]
 name = "hnswx"
-version = "0.2.0"
+version = "0.2.5"
 edition = "2024"
 authors = ["happyboy <superhappyboy1995@gmail.com>"]
 description = "A Rust implementation of the Hierarchical Navigable Small World (HNSW) algorithm. HNSW is an efficient approximate nearest neighbor search algorithm, particularly suitable for high-dimensional vector retrieval."
