@@ -1,12 +1,16 @@
 use bit_vec::BitVec;
 use hashbrown::HashSet;
+use parking_lot::{Mutex, RwLock};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rayon::prelude::*;
+use smallvec::SmallVec;
 use std::cmp::{max, min};
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 
-use crate::config::{HnswConfig, HnswStats};
+use crate::config::{ConcurrentStats, HnswConfig, HnswStats};
 use crate::metrics::DistanceMetric;
 use crate::node::{HnswNode, SearchResult};
 use crate::storage::FlatVecStorage;
@@ -63,6 +67,8 @@ pub struct HNSW<D: DistanceMetric> {
     deleted_bits: BitVec,
     /// Next available node ID
     next_id: usize,
+    /// Concurrent statistics
+    concurrent_stats: ConcurrentStats,
 }
 
 impl<D: DistanceMetric> HNSW<D> {
@@ -71,7 +77,6 @@ impl<D: DistanceMetric> HNSW<D> {
         let max_elements = config.max_elements;
         let max_level = ((max_elements as f64).ln() * config.level_multiplier) as usize;
         let initial_capacity = min(1000, max_elements);
-
         Self {
             config,
             vec_storage: FlatVecStorage::new(0, initial_capacity),
@@ -83,7 +88,16 @@ impl<D: DistanceMetric> HNSW<D> {
             rng: StdRng::from_entropy(),
             deleted_bits: BitVec::from_elem(max_elements, false),
             next_id: 0,
+            concurrent_stats: ConcurrentStats::default(),
         }
+    }
+
+    /// Concurrent HNSW wrapper for thread-safe operations
+    pub fn into_concurrent(self) -> ConcurrentHNSW<D>
+    where
+        D: 'static + Send + Sync,
+    {
+        ConcurrentHNSW::new(self)
     }
 
     /// Generate random level for a new node
@@ -178,15 +192,34 @@ impl<D: DistanceMetric> HNSW<D> {
         node_id
     }
 
+    /// Batch insert multiple vectors (optimized)
+    pub fn insert_batch(&mut self, vectors: Vec<Vec<f32>>) -> Vec<usize> {
+        let vectors_len = vectors.len();
+        let mut ids = Vec::with_capacity(vectors_len);
+        let new_next_id = self.next_id + vectors_len;
+        if new_next_id > self.nodes.len() {
+            let new_size = min(
+                max(new_next_id, self.nodes.len() * 2),
+                self.config.max_elements,
+            );
+            self.nodes.resize_with(new_size, || None);
+            self.deleted_bits.grow(new_size, false);
+        }
+        for vector in vectors {
+            let id = self.insert(vector);
+            ids.push(id);
+        }
+        self.concurrent_stats.parallel_inserts += 1;
+        self.concurrent_stats.avg_batch_size =
+            (self.concurrent_stats.avg_batch_size * 0.9 + vectors_len as f32 * 0.1);
+        ids
+    }
+
     /// Optimized single-point search in a layer
     fn search_layer_best(&self, query: &[f32], entry_point: usize, layer: usize) -> Option<usize> {
         if entry_point >= self.nodes.len() {
             return None;
         }
-        let entry_node = match self.get_node(entry_point) {
-            Some(node) => node,
-            None => return None,
-        };
         let mut best_id = entry_point;
         let entry_vector = self.vec_storage.get_vector(entry_point);
         let mut best_dist_sq = self.metric.distance_squared_direct(query, entry_vector);
@@ -325,10 +358,6 @@ impl<D: DistanceMetric> HNSW<D> {
         ef: usize,
         layer: usize,
     ) -> Option<Vec<SearchResult>> {
-        let entry_node = match self.get_node(entry_point) {
-            Some(node) => node,
-            None => return None,
-        };
         let entry_vector = self.vec_storage.get_vector(entry_point);
         let entry_dist_sq = self.metric.distance_squared_direct(query, entry_vector);
         let mut candidates = BinaryHeap::new();
@@ -392,7 +421,7 @@ impl<D: DistanceMetric> HNSW<D> {
     fn add_connection(&mut self, from: usize, to: usize, layer: usize) {
         if let Some(node) = self.nodes[from].as_mut() {
             if layer >= node.friends.len() {
-                node.friends.resize(layer + 1, Vec::new());
+                node.friends.resize(layer + 1, SmallVec::new());
             }
             if !node.friends[layer].contains(&to) {
                 node.friends[layer].push(to);
@@ -472,6 +501,20 @@ impl<D: DistanceMetric> HNSW<D> {
         final_results
     }
 
+    /// Parallel search for multiple queries
+    pub fn search_knn_batch(&mut self, queries: &[Vec<f32>], k: usize) -> Vec<Vec<SearchResult>> {
+        if queries.is_empty() {
+            return Vec::new();
+        }
+        let results: Vec<Vec<SearchResult>> = queries
+            .par_iter()
+            .with_min_len(self.config.batch_size)
+            .map(|query| self.search_knn(query, k))
+            .collect();
+        self.concurrent_stats.parallel_searches += queries.len();
+        results
+    }
+
     /// Delete a node from the index
     pub fn delete(&mut self, node_id: usize) -> bool {
         if node_id >= self.nodes.len() || self.nodes[node_id].is_none() {
@@ -501,7 +544,7 @@ impl<D: DistanceMetric> HNSW<D> {
             if neighbor_id < self.nodes.len() {
                 if let Some(neighbor) = self.nodes[neighbor_id].as_mut() {
                     if layer < neighbor.friends.len() {
-                        neighbor.friends[layer].retain(|&id| id != node_id);
+                        neighbor.friends[layer].retain(|id| *id != node_id);
                     }
                 }
             }
@@ -564,6 +607,7 @@ impl<D: DistanceMetric> HNSW<D> {
             deleted_count: self.deleted_bits.iter().filter(|&b| b).count(),
             vector_dim: self.vec_storage.dim(),
             storage_size: self.vec_storage.data.len(),
+            concurrent_stats: self.concurrent_stats.clone(),
         }
     }
 
@@ -594,5 +638,96 @@ impl<D: DistanceMetric> HNSW<D> {
             std::io::ErrorKind::Other,
             "Not implemented",
         ))
+    }
+}
+
+/// Thread-safe concurrent HNSW index
+pub struct ConcurrentHNSW<D>
+where
+    D: DistanceMetric + 'static + Send + Sync,
+{
+    inner: Arc<RwLock<HNSW<D>>>,
+    write_queue: Mutex<Vec<Vec<f32>>>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<D: DistanceMetric + 'static + Send + Sync> ConcurrentHNSW<D> {
+    /// Create a new concurrent HNSW instance
+    pub fn new(hnsw: HNSW<D>) -> Self {
+        let inner = Arc::new(RwLock::new(hnsw));
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let write_queue = Mutex::new(Vec::new());
+        let inner_clone = inner.clone();
+        let stop_flag_clone = stop_flag.clone();
+        let worker_handle = std::thread::spawn(move || {
+            Self::background_worker(inner_clone, stop_flag_clone);
+        });
+        Self {
+            inner,
+            write_queue,
+            worker_handle: Some(worker_handle),
+            stop_flag,
+        }
+    }
+
+    fn background_worker(
+        inner: Arc<RwLock<HNSW<D>>>,
+        stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        const BATCH_SIZE: usize = 100;
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if batch.len() >= BATCH_SIZE {
+                let mut guard = inner.write();
+                guard.insert_batch(std::mem::take(&mut batch));
+            }
+        }
+    }
+
+    pub fn search_knn(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        let guard = self.inner.read();
+        guard.search_knn(query, k)
+    }
+
+    pub fn search_knn_batch(&self, queries: &[Vec<f32>], k: usize) -> Vec<Vec<SearchResult>> {
+        let mut write_guard = self.inner.write();
+        write_guard.search_knn_batch(queries, k)
+    }
+
+    pub fn insert_async(&self, vector: Vec<f32>) {
+        let mut queue = self.write_queue.lock();
+        queue.push(vector);
+        if queue.len() >= 100 {
+            let batch = std::mem::take(&mut *queue);
+            let inner = self.inner.clone();
+            rayon::spawn(move || {
+                let mut guard = inner.write();
+                guard.insert_batch(batch);
+            });
+        }
+    }
+
+    pub fn stats(&self) -> HnswStats {
+        let guard = self.inner.read();
+        guard.stats()
+    }
+
+    pub fn stop(&mut self) {
+        self.stop_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl<D> Drop for ConcurrentHNSW<D>
+where
+    D: DistanceMetric + 'static + Send + Sync,
+{
+    fn drop(&mut self) {
+        self.stop();
     }
 }

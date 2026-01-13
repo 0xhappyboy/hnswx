@@ -16,7 +16,7 @@ mod test_1 {
             ef_search: 10,
             ..Default::default()
         };
-        let mut hnsw = HNSW::new(config, EuclideanDistance);
+        let mut hnsw = HNSW::new(config, EuclideanDistance::new());
         let vectors = vec![
             vec![1.0, 2.0, 3.0],
             vec![2.0, 3.0, 4.0],
@@ -41,7 +41,7 @@ mod test_1 {
     #[test]
     fn test_cosine_similarity() {
         let config = HnswConfig::default();
-        let mut hnsw = HNSW::new(config, CosineSimilarity);
+        let mut hnsw = HNSW::new(config, CosineSimilarity::new());
         let vectors = vec![
             vec![1.0, 0.0, 0.0],
             vec![0.0, 1.0, 0.0],

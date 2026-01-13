@@ -10,10 +10,14 @@ readme = "README.md"
 repository = "https://github.com/0xhappyboy/hnswx"
 
 [dependencies]
+bit-vec = "0.6"
+hashbrown = "0.14"
 rand = "0.8"
-ordered-float = "3.0"
-hashbrown = "0.16.1"
-bit-vec = "0.8.0"
+ordered-float = "3.7"
+parking_lot = "0.12"
+rayon = "1.7"
+smallvec = "1.11" 
+crossbeam = "0.8.4"
 
 [dev-dependencies]
 rand = "0.8"

@@ -16,6 +16,10 @@ pub struct HnswConfig {
     pub level_multiplier: f64,
     /// Whether to allow replacing deleted elements
     pub allow_replace_deleted: bool,
+    /// Number of worker threads for concurrent operations (0 = auto)
+    pub num_threads: usize,
+    /// Batch size for concurrent operations
+    pub batch_size: usize,
 }
 
 impl Default for HnswConfig {
@@ -29,6 +33,8 @@ impl Default for HnswConfig {
             ef_search: 10,
             level_multiplier: 1.0 / f64::ln(16.0),
             allow_replace_deleted: true,
+            num_threads: 0, // 0 means auto-detect
+            batch_size: 64,
         }
     }
 }
@@ -52,4 +58,14 @@ pub struct HnswStats {
     pub vector_dim: usize,
     /// Total storage size in floats
     pub storage_size: usize,
+    /// Concurrent operations statistics
+    pub concurrent_stats: ConcurrentStats,
+}
+
+/// Concurrent operations statistics
+#[derive(Debug, Clone, Default)]
+pub struct ConcurrentStats {
+    pub parallel_searches: usize,
+    pub parallel_inserts: usize,
+    pub avg_batch_size: f32,
 }

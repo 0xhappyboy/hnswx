@@ -17,9 +17,9 @@ mod querying_100k_data {
             ef_search: 50,
             ..Default::default()
         };
-        let mut hnsw = HNSW::new(config, EuclideanDistance);
+        let mut hnsw = HNSW::new(config, EuclideanDistance::new());
         let mut rng = rand::thread_rng();
-        let dim = 32;
+        let dim = 128;
         let num_vectors = 100_000;
         println!("Starting to insert {} {}D vectors", num_vectors, dim);
         let insert_start = Instant::now();
@@ -180,7 +180,7 @@ mod querying_100k_data {
             ef_search: 20,
             ..Default::default()
         };
-        let mut hnsw = HNSW::new(config, EuclideanDistance);
+        let mut hnsw = HNSW::new(config, EuclideanDistance::new());
         let mut rng = rand::thread_rng();
         let dim = 16;
         let num_vectors = 10_000;
@@ -250,7 +250,7 @@ mod querying_100k_data {
         ];
         for (name, config) in test_configs {
             println!("\nTesting configuration: {}", name);
-            let mut hnsw = HNSW::new(config, EuclideanDistance);
+            let mut hnsw = HNSW::new(config, EuclideanDistance::new());
             let mut rng = rand::thread_rng();
             let dim = 16;
             let num_vectors = 2_000;

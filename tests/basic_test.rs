@@ -9,7 +9,7 @@ mod basic_test {
 
     #[test]
     fn test_hnsw_basic_operations() {
-        let mut hnsw = HNSW::new(HnswConfig::default(), EuclideanDistance);
+        let mut hnsw = HNSW::new(HnswConfig::default(), EuclideanDistance::new());
         println!("Inserting data");
         let id1 = hnsw.insert(vec![1.0, 2.0, 3.0]);
         let id2 = hnsw.insert(vec![2.0, 3.0, 4.0]);
@@ -42,7 +42,7 @@ mod basic_test {
             ef_search: 20,
             ..Default::default()
         };
-        let mut hnsw = HNSW::new(config, EuclideanDistance);
+        let mut hnsw = HNSW::new(config, EuclideanDistance::new());
         let mut rng = rand::thread_rng();
         let dim = 8;
         let num_vectors = 1_000;
@@ -88,7 +88,7 @@ mod basic_test {
     #[test]
     fn test_hnsw_edge_cases() {
         println!("Testing edge cases");
-        let mut hnsw = HNSW::new(HnswConfig::default(), EuclideanDistance);
+        let mut hnsw = HNSW::new(HnswConfig::default(), EuclideanDistance::new());
         let results = hnsw.search_knn(&[1.0, 2.0, 3.0], 5);
         assert!(
             results.is_empty(),

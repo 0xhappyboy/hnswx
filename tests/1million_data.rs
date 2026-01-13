@@ -20,7 +20,7 @@ mod querying_1million_data {
             level_multiplier: 1.0 / f64::ln(32.0),
             ..Default::default()
         };
-        let mut hnsw = HNSW::new(config.clone(), EuclideanDistance);
+        let mut hnsw = HNSW::new(config.clone(), EuclideanDistance::new());
         let mut rng = rand::thread_rng();
         let dim = 32; // 32-dimensional vectors
         let num_vectors = 1_000_000;
@@ -321,7 +321,7 @@ mod querying_1million_data {
                 "Parameters: m={}, m_max={}, ef_construction={}, ef_search={}",
                 config.m, config.m_max, config.ef_construction, config.ef_search
             );
-            let mut hnsw = HNSW::new(config.clone(), EuclideanDistance);
+            let mut hnsw = HNSW::new(config.clone(), EuclideanDistance::new());
             let mut rng = rand::thread_rng();
             let dim = 32;
             let test_vectors = 100_000; // Test with 100k vectors

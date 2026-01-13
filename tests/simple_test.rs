@@ -6,7 +6,7 @@ mod simple_test {
 
     #[test]
     fn test_hnsw_basic_operations() {
-        let mut hnsw = HNSW::new(HnswConfig::default(), EuclideanDistance);
+        let mut hnsw = HNSW::new(HnswConfig::default(), EuclideanDistance::new());
         let id = hnsw.insert(vec![1.0, 2.0, 3.0]);
         let results = hnsw.search_knn(&[1.1, 2.1, 3.1], 1);
         let deleted = hnsw.delete(id);
