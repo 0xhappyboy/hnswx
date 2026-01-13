@@ -4,6 +4,7 @@ pub mod hnsw;
 pub mod metrics;
 pub mod node;
 pub mod storage;
+pub mod global;
 
 pub use config::{HnswConfig, HnswStats};
 pub use hnsw::{ConcurrentHNSW, HNSW};

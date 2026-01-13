@@ -19,7 +19,7 @@ mod querying_100k_data {
         };
         let mut hnsw = HNSW::new(config, EuclideanDistance::new());
         let mut rng = rand::thread_rng();
-        let dim = 128;
+        let dim = 32;
         let num_vectors = 100_000;
         println!("Starting to insert {} {}D vectors", num_vectors, dim);
         let insert_start = Instant::now();

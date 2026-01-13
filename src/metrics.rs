@@ -94,7 +94,6 @@ impl EuclideanDistance {
                     let sums = _mm_add_ps(squared, shuf);
                     let shuf2 = _mm_shuffle_ps(sums, sums, 0b10110001);
                     let final_sum = _mm_add_ps(sums, shuf2);
-
                     sum += _mm_cvtss_f32(final_sum);
                 }
                 i += chunk_size;

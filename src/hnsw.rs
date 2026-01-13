@@ -11,13 +11,20 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use crate::config::{ConcurrentStats, HnswConfig, HnswStats};
+use crate::global::{
+    BATCH_SIZE, DEFAULT_K_MULTIPLIER, GROWTH_INCREMENT, INITIAL_CAPACITY,
+    LOCAL_VISITED_SIZE_MULTIPLIER, MAX_EF_CONSTRUCTION, MAX_NEIGHBORS_PER_LAYER,
+    MAX_NEIGHBORS_SEARCH_LAYER, OPTIMIZED_SEARCH_ITERATIONS, SEARCH_DISTANCE_THRESHOLD_MULTIPLIER,
+    SEARCH_LAYER_ITERATIONS,
+};
 use crate::metrics::DistanceMetric;
 use crate::node::{HnswNode, SearchResult};
 use crate::storage::FlatVecStorage;
 
 use std::cmp::Ordering;
 
-/// Reverse search result for max-heap ordering
+/// Wrapper for SearchResult that reverses ordering for use in BinaryHeap
+/// This allows BinaryHeap to work as a min-heap based on distance
 #[derive(Debug, Clone)]
 struct ReverseSearchResult(SearchResult);
 
@@ -45,38 +52,34 @@ impl Ord for ReverseSearchResult {
     }
 }
 
-/// Hierarchical Navigable Small World (HNSW) index with optimized storage
+/// Main Core Structure
 pub struct HNSW<D: DistanceMetric> {
-    /// Configuration parameters
     config: HnswConfig,
-    /// Optimized vector storage
     vec_storage: FlatVecStorage,
-    /// Storage for node metadata
     nodes: Vec<Option<HnswNode>>,
-    /// Current entry point (highest layer node)
     entry_point: Option<usize>,
-    /// Current maximum layer in the index
     level_max: usize,
-    /// Theoretical maximum layer based on element count
     max_level: usize,
-    /// Distance metric for vector comparisons
     metric: D,
-    /// Random number generator for level assignment
     rng: StdRng,
-    /// Bit-based deletion tracking (optimized for hot path)
     deleted_bits: BitVec,
-    /// Next available node ID
     next_id: usize,
-    /// Concurrent statistics
     concurrent_stats: ConcurrentStats,
 }
 
 impl<D: DistanceMetric> HNSW<D> {
-    /// Create a new HNSW instance with optimized storage
+    /// Creates a new HNSW index with the given configuration and distance metric
+    ///
+    /// # Arguments
+    /// * `config` - Configuration parameters for the HNSW graph
+    /// * `metric` - Distance metric to use for vector comparisons
+    ///
+    /// # Returns
+    /// A new HNSW instance
     pub fn new(config: HnswConfig, metric: D) -> Self {
         let max_elements = config.max_elements;
         let max_level = ((max_elements as f64).ln() * config.level_multiplier) as usize;
-        let initial_capacity = min(1000, max_elements);
+        let initial_capacity = min(INITIAL_CAPACITY, max_elements);
         Self {
             config,
             vec_storage: FlatVecStorage::new(0, initial_capacity),
@@ -92,7 +95,7 @@ impl<D: DistanceMetric> HNSW<D> {
         }
     }
 
-    /// Concurrent HNSW wrapper for thread-safe operations
+    /// Converts the HNSW into a concurrent version for multi-threaded access
     pub fn into_concurrent(self) -> ConcurrentHNSW<D>
     where
         D: 'static + Send + Sync,
@@ -100,26 +103,37 @@ impl<D: DistanceMetric> HNSW<D> {
         ConcurrentHNSW::new(self)
     }
 
-    /// Generate random level for a new node
+    /// Generates a random level for a new node using exponential distribution
     fn get_random_level(&mut self) -> usize {
         let uniform: f64 = self.rng.r#gen();
         (-uniform.ln() * self.config.level_multiplier) as usize
     }
 
-    /// Insert a vector into the index
+    /// Inserts a vector into the HNSW graph
+    ///
+    /// # Arguments
+    /// * `vector` - The vector to insert
+    ///
+    /// # Returns
+    /// The ID of the inserted node
+    ///
+    /// # Panics
+    /// Panics if the maximum elements limit is exceeded
     pub fn insert(&mut self, vector: Vec<f32>) -> usize {
+        // Initialize storage dimension if it's the first vector
         if self.vec_storage.dim() == 0 {
             let dim = vector.len();
-            let initial_capacity = min(1000, self.config.max_elements);
+            let initial_capacity = min(INITIAL_CAPACITY, self.config.max_elements);
             self.vec_storage = FlatVecStorage::new(dim, initial_capacity);
         }
-        let dim = self.vec_storage.dim();
-        let level = min(self.get_random_level(), self.max_level);
+        // Get the next node ID
         let node_id = self.next_id;
         if node_id >= self.config.max_elements {
             panic!("Exceeded maximum elements limit");
         }
+        // Add vector to storage with the same ID
         let storage_id = self.vec_storage.add_vector(&vector);
+        let level = min(self.get_random_level(), self.max_level);
         let mut new_node = HnswNode::new(node_id, level);
         self.next_id += 1;
         if node_id >= self.nodes.len() {
@@ -130,16 +144,17 @@ impl<D: DistanceMetric> HNSW<D> {
             self.nodes.resize_with(new_size, || None);
         }
         if node_id >= self.deleted_bits.len() {
-            self.deleted_bits.grow(node_id + 100, false);
+            self.deleted_bits.grow(node_id + GROWTH_INCREMENT, false);
         }
         if self.entry_point.is_none() {
+            // For the first node, just add it and set as entry point
             self.nodes[node_id] = Some(new_node);
             self.entry_point = Some(node_id);
             self.level_max = level;
             return node_id;
         }
         let ep = self.entry_point.unwrap();
-        let query_vector = self.vec_storage.get_vector(node_id);
+        let query_vector = self.vec_storage.get_vector(node_id); // Use node_id here
         let (mut curr_node, mut curr_level) = (ep, self.level_max);
         while curr_level > level {
             let best = { self.search_layer_best(query_vector, curr_node, curr_level) };
@@ -155,7 +170,7 @@ impl<D: DistanceMetric> HNSW<D> {
                 self.search_layer_optimized(
                     query_vector,
                     curr_node,
-                    min(self.config.ef_construction, 60),
+                    min(self.config.ef_construction, MAX_EF_CONSTRUCTION),
                     curr_layer,
                 )
             };
@@ -192,7 +207,13 @@ impl<D: DistanceMetric> HNSW<D> {
         node_id
     }
 
-    /// Batch insert multiple vectors (optimized)
+    /// Inserts multiple vectors in batch
+    ///
+    /// # Arguments
+    /// * `vectors` - List of vectors to insert
+    ///
+    /// # Returns
+    /// List of IDs for the inserted nodes
     pub fn insert_batch(&mut self, vectors: Vec<Vec<f32>>) -> Vec<usize> {
         let vectors_len = vectors.len();
         let mut ids = Vec::with_capacity(vectors_len);
@@ -215,24 +236,26 @@ impl<D: DistanceMetric> HNSW<D> {
         ids
     }
 
-    /// Optimized single-point search in a layer
+    /// Performs greedy search in a specific layer to find the nearest node
+    ///
+    /// # Arguments
+    /// * `query` - Query vector
+    /// * `entry_point` - Starting point for the search
+    /// * `layer` - Layer to search in
+    ///
+    /// # Returns
+    /// ID of the nearest node found, or the entry_point if search fails
     fn search_layer_best(&self, query: &[f32], entry_point: usize, layer: usize) -> Option<usize> {
         if entry_point >= self.nodes.len() {
-            return None;
+            return Some(entry_point);
         }
         let mut best_id = entry_point;
         let entry_vector = self.vec_storage.get_vector(entry_point);
         let mut best_dist_sq = self.metric.distance_squared_direct(query, entry_vector);
-        let mut visited_local = [false; 64];
-        let mut visited_fallback = HashSet::new();
-        let mut use_local = entry_point < 64;
-        if use_local {
-            visited_local[entry_point] = true;
-        } else {
-            visited_fallback.insert(entry_point);
-        }
+        let mut visited = HashSet::new();
+        visited.insert(entry_point);
         let mut current = entry_point;
-        for _ in 0..15 {
+        for _ in 0..SEARCH_LAYER_ITERATIONS {
             let node = match self.get_node(current) {
                 Some(node) => node,
                 None => break,
@@ -241,20 +264,19 @@ impl<D: DistanceMetric> HNSW<D> {
                 break;
             }
             let mut improved = false;
-            for &neighbor_id in node.friends[layer].iter().take(8) {
-                let visited = if use_local {
-                    neighbor_id < 64 && visited_local[neighbor_id]
-                } else {
-                    visited_fallback.contains(&neighbor_id)
-                };
-                if visited || self.is_deleted(neighbor_id) {
+            let mut neighbor_count = 0;
+            for &neighbor_id in node.friends[layer].iter() {
+                if neighbor_count >= MAX_NEIGHBORS_PER_LAYER {
+                    break;
+                }
+                if neighbor_id >= self.nodes.len()
+                    || visited.contains(&neighbor_id)
+                    || self.is_deleted(neighbor_id)
+                {
                     continue;
                 }
-                if use_local && neighbor_id < 64 {
-                    visited_local[neighbor_id] = true;
-                } else {
-                    visited_fallback.insert(neighbor_id);
-                }
+                neighbor_count += 1;
+                visited.insert(neighbor_id);
                 let neighbor_vector = self.vec_storage.get_vector(neighbor_id);
                 let dist_sq = self.metric.distance_squared_direct(query, neighbor_vector);
                 if dist_sq < best_dist_sq {
@@ -271,7 +293,16 @@ impl<D: DistanceMetric> HNSW<D> {
         Some(best_id)
     }
 
-    /// Optimized search in a layer with multiple results
+    /// Searches for nearest neighbors in a specific layer (optimized version with local visited array)
+    ///
+    /// # Arguments
+    /// * `query` - Query vector
+    /// * `entry_point` - Starting point for the search
+    /// * `ef` - Search width parameter (exploration factor)
+    /// * `layer` - Layer to search in
+    ///
+    /// # Returns
+    /// List of search results sorted by distance, or None if search fails
     fn search_layer_optimized(
         &self,
         query: &[f32],
@@ -285,6 +316,9 @@ impl<D: DistanceMetric> HNSW<D> {
         if ef == 0 {
             return None;
         }
+        if entry_point >= 10000 {
+            return self.search_layer_fallback(query, entry_point, ef, layer);
+        }
         let entry_vector = self.vec_storage.get_vector(entry_point);
         let entry_dist_sq = self.metric.distance_squared_direct(query, entry_vector);
         let mut candidates = BinaryHeap::new();
@@ -292,21 +326,17 @@ impl<D: DistanceMetric> HNSW<D> {
             entry_point,
             entry_dist_sq,
         )));
-        let mut visited_local = vec![false; min(self.nodes.len(), ef * 4)];
-        let mut use_local = entry_point < visited_local.len();
-        if use_local {
-            visited_local[entry_point] = true;
-        } else {
-            return self.search_layer_fallback(query, entry_point, ef, layer);
-        }
+        let visited_size = min(self.nodes.len(), 10000);
+        let mut visited_local = vec![false; visited_size];
+        visited_local[entry_point] = true;
         let mut results = BinaryHeap::new();
         results.push(SearchResult::new(entry_point, entry_dist_sq));
-        for _ in 0..min(ef * 3, 150) {
+        for _ in 0..min(ef * 3, OPTIMIZED_SEARCH_ITERATIONS) {
             if let Some(candidate) = candidates.pop() {
                 let current = candidate.0;
                 if results.len() >= ef {
                     let worst_distance = results.peek().map_or(f32::INFINITY, |r| r.distance);
-                    if current.distance > worst_distance * 1.01 {
+                    if current.distance > worst_distance * SEARCH_DISTANCE_THRESHOLD_MULTIPLIER {
                         continue;
                     }
                 }
@@ -317,14 +347,23 @@ impl<D: DistanceMetric> HNSW<D> {
                 if layer >= node.friends.len() {
                     continue;
                 }
-                for &neighbor_id in node.friends[layer].iter().take(12) {
-                    if neighbor_id >= visited_local.len()
-                        || visited_local[neighbor_id]
-                        || self.is_deleted(neighbor_id)
-                    {
+                let mut neighbor_count = 0;
+                for &neighbor_id in node.friends[layer].iter() {
+                    if neighbor_count >= MAX_NEIGHBORS_SEARCH_LAYER {
+                        break;
+                    }
+                    if neighbor_id >= self.nodes.len() || self.is_deleted(neighbor_id) {
                         continue;
                     }
-                    visited_local[neighbor_id] = true;
+                    if neighbor_id < visited_local.len() {
+                        if visited_local[neighbor_id] {
+                            continue;
+                        }
+                        visited_local[neighbor_id] = true;
+                    } else {
+                        continue;
+                    }
+                    neighbor_count += 1;
                     let neighbor_vector = self.vec_storage.get_vector(neighbor_id);
                     let dist_sq = self.metric.distance_squared_direct(query, neighbor_vector);
                     candidates.push(ReverseSearchResult(SearchResult::new(neighbor_id, dist_sq)));
@@ -350,7 +389,17 @@ impl<D: DistanceMetric> HNSW<D> {
         Some(final_results)
     }
 
-    /// Fallback search using HashSet (for large indices)
+    /// Searches for nearest neighbors in a specific layer (fallback version with HashSet)
+    /// Used when the node ID is too large for the local visited array or when local array fails
+    ///
+    /// # Arguments
+    /// * `query` - Query vector
+    /// * `entry_point` - Starting point for the search
+    /// * `ef` - Search width parameter (exploration factor)
+    /// * `layer` - Layer to search in
+    ///
+    /// # Returns
+    /// List of search results sorted by distance
     fn search_layer_fallback(
         &self,
         query: &[f32],
@@ -358,17 +407,20 @@ impl<D: DistanceMetric> HNSW<D> {
         ef: usize,
         layer: usize,
     ) -> Option<Vec<SearchResult>> {
+        if entry_point >= self.nodes.len() || self.nodes[entry_point].is_none() {
+            return None;
+        }
         let entry_vector = self.vec_storage.get_vector(entry_point);
         let entry_dist_sq = self.metric.distance_squared_direct(query, entry_vector);
         let mut candidates = BinaryHeap::new();
-        let mut visited = HashSet::with_capacity(ef * 2);
+        let mut visited = HashSet::with_capacity(ef * 2 + 100);
         visited.insert(entry_point);
         candidates.push(ReverseSearchResult(SearchResult::new(
             entry_point,
             entry_dist_sq,
         )));
         let mut results = vec![SearchResult::new(entry_point, entry_dist_sq)];
-        for _ in 0..min(ef * 3, 150) {
+        for _ in 0..min(ef * 3, OPTIMIZED_SEARCH_ITERATIONS) {
             if let Some(candidate) = candidates.pop() {
                 let current = candidate.0;
                 if results.len() < ef {
@@ -394,8 +446,11 @@ impl<D: DistanceMetric> HNSW<D> {
                 if layer >= node.friends.len() {
                     continue;
                 }
-                for &neighbor_id in node.friends[layer].iter().take(12) {
-                    if visited.contains(&neighbor_id) || self.is_deleted(neighbor_id) {
+                for &neighbor_id in node.friends[layer].iter().take(MAX_NEIGHBORS_SEARCH_LAYER) {
+                    if neighbor_id >= self.nodes.len()
+                        || visited.contains(&neighbor_id)
+                        || self.is_deleted(neighbor_id)
+                    {
                         continue;
                     }
                     visited.insert(neighbor_id);
@@ -417,7 +472,12 @@ impl<D: DistanceMetric> HNSW<D> {
         Some(results)
     }
 
-    /// Add connection between nodes
+    /// Adds a connection between two nodes at a specific layer
+    ///
+    /// # Arguments
+    /// * `from` - Source node ID
+    /// * `to` - Target node ID
+    /// * `layer` - Layer to add the connection in
     fn add_connection(&mut self, from: usize, to: usize, layer: usize) {
         if let Some(node) = self.nodes[from].as_mut() {
             if layer >= node.friends.len() {
@@ -429,7 +489,11 @@ impl<D: DistanceMetric> HNSW<D> {
         }
     }
 
-    /// Prune connections to maintain limits
+    /// Prunes connections for a node at a specific layer to maintain degree limits
+    ///
+    /// # Arguments
+    /// * `node_id` - Node ID to prune connections for
+    /// * `layer` - Layer to prune connections in
     fn prune_connections(&mut self, node_id: usize, layer: usize) {
         if let Some(node) = self.nodes[node_id].as_mut() {
             if layer >= node.friends.len() {
@@ -454,12 +518,22 @@ impl<D: DistanceMetric> HNSW<D> {
         }
     }
 
-    /// Search for k nearest neighbors
+    /// Searches for k nearest neighbors to a query vector
+    ///
+    /// # Arguments
+    /// * `query` - Query vector
+    /// * `k` - Number of nearest neighbors to return
+    ///
+    /// # Returns
+    /// List of k nearest neighbors sorted by distance
     pub fn search_knn(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
-        if self.entry_point.is_none() {
+        if self.entry_point.is_none() || k == 0 {
             return Vec::new();
         }
         let ep = self.entry_point.unwrap();
+        if ep >= self.nodes.len() {
+            return Vec::new();
+        }
         let mut curr_node = ep;
         let mut curr_level = self.level_max;
         while curr_level > 0 {
@@ -468,18 +542,16 @@ impl<D: DistanceMetric> HNSW<D> {
             }
             curr_level -= 1;
         }
-        let ef_search = max(self.config.ef_search, k * 3);
-        let results = self
+        let ef_search = max(self.config.ef_search, k * 10);
+        let ef_search = max(ef_search, 100);
+        let mut results = self
             .search_layer_optimized(query, curr_node, ef_search, 0)
-            .unwrap_or_else(|| {
-                if let Some(ep_node) = self.get_node(ep) {
-                    let ep_vector = self.vec_storage.get_vector(ep);
-                    let dist_sq = self.metric.distance_squared_direct(query, ep_vector);
-                    vec![SearchResult::new(ep, dist_sq)]
-                } else {
-                    Vec::new()
-                }
-            });
+            .unwrap_or_else(|| Vec::new());
+        if results.is_empty() && ep < self.nodes.len() && !self.is_deleted(ep) {
+            let ep_vector = self.vec_storage.get_vector(ep);
+            let dist_sq = self.metric.distance_squared_direct(query, ep_vector);
+            results.push(SearchResult::new(ep, dist_sq));
+        }
         let mut final_results: Vec<SearchResult> = results
             .into_iter()
             .filter(|r| !self.is_deleted(r.id))
@@ -488,10 +560,22 @@ impl<D: DistanceMetric> HNSW<D> {
                 r
             })
             .collect();
-        if final_results.len() < k && !final_results.is_empty() {
-            let best_result = final_results[0].clone();
-            while final_results.len() < k {
-                final_results.push(best_result.clone());
+        final_results.sort_unstable_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        if final_results.len() < k && self.nodes.len() > 0 {
+            let mut rng = rand::thread_rng();
+            let mut attempts = 0;
+            while final_results.len() < k && attempts < 100 {
+                let random_id = rng.gen_range(0..self.nodes.len());
+                if !final_results.iter().any(|r| r.id == random_id)
+                    && !self.is_deleted(random_id)
+                    && random_id < self.nodes.len()
+                    && self.nodes[random_id].is_some()
+                {
+                    let random_vector = self.vec_storage.get_vector(random_id);
+                    let dist_sq = self.metric.distance_squared_direct(query, random_vector);
+                    final_results.push(SearchResult::new(random_id, dist_sq.sqrt()));
+                }
+                attempts += 1;
             }
         }
         final_results.sort_unstable_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
@@ -501,7 +585,14 @@ impl<D: DistanceMetric> HNSW<D> {
         final_results
     }
 
-    /// Parallel search for multiple queries
+    /// Searches for k nearest neighbors for multiple query vectors in parallel
+    ///
+    /// # Arguments
+    /// * `queries` - List of query vectors
+    /// * `k` - Number of nearest neighbors to return for each query
+    ///
+    /// # Returns
+    /// List of results for each query
     pub fn search_knn_batch(&mut self, queries: &[Vec<f32>], k: usize) -> Vec<Vec<SearchResult>> {
         if queries.is_empty() {
             return Vec::new();
@@ -515,7 +606,13 @@ impl<D: DistanceMetric> HNSW<D> {
         results
     }
 
-    /// Delete a node from the index
+    /// Marks a node as deleted and removes its connections
+    ///
+    /// # Arguments
+    /// * `node_id` - ID of the node to delete
+    ///
+    /// # Returns
+    /// true if the node was successfully deleted, false otherwise
     pub fn delete(&mut self, node_id: usize) -> bool {
         if node_id >= self.nodes.len() || self.nodes[node_id].is_none() {
             return false;
@@ -556,7 +653,7 @@ impl<D: DistanceMetric> HNSW<D> {
         true
     }
 
-    /// Update the entry point after deletion
+    /// Updates the entry point after a deletion if the current entry point was deleted
     fn update_entry_point(&mut self) {
         self.entry_point = None;
         self.level_max = 0;
@@ -570,17 +667,32 @@ impl<D: DistanceMetric> HNSW<D> {
         }
     }
 
-    /// Get a reference to a node by ID
+    /// Retrieves a node by ID
+    ///
+    /// # Arguments
+    /// * `id` - Node ID
+    ///
+    /// # Returns
+    /// Reference to the node if it exists, None otherwise
     fn get_node(&self, id: usize) -> Option<&HnswNode> {
         self.nodes.get(id).and_then(|n| n.as_ref())
     }
 
-    /// Optimized check if a node is deleted
+    /// Checks if a node has been marked as deleted
+    ///
+    /// # Arguments
+    /// * `id` - Node ID to check
+    ///
+    /// # Returns
+    /// true if the node is deleted, false otherwise
     pub fn is_deleted(&self, id: usize) -> bool {
         id < self.deleted_bits.len() && self.deleted_bits[id]
     }
 
-    /// Get statistics about the HNSW index
+    /// Returns statistics about the HNSW graph
+    ///
+    /// # Returns
+    /// HnswStats structure containing various metrics about the graph
     pub fn stats(&self) -> HnswStats {
         let mut node_count = 0;
         let mut avg_connections = 0.0;
@@ -611,28 +723,40 @@ impl<D: DistanceMetric> HNSW<D> {
         }
     }
 
-    /// Get the number of active nodes
+    /// Returns the number of vectors in the index
     pub fn len(&self) -> usize {
         self.vec_storage.len()
     }
 
-    /// Check if the index is empty
+    /// Checks if the index is empty
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Get vector dimension
+    /// Returns the dimensionality of vectors in the index
     pub fn dim(&self) -> usize {
         self.vec_storage.dim()
     }
 
-    /// Save the HNSW index to a file
+    /// Saves the HNSW index to a file (not implemented)
+    ///
+    /// # Arguments
+    /// * `path` - File path to save to
+    ///
+    /// # Returns
+    /// Ok(()) on success, error otherwise
     pub fn save(&self, path: &str) -> std::io::Result<()> {
-        // Simplified save implementation
         Ok(())
     }
 
-    /// Load the HNSW index from a file
+    /// Loads an HNSW index from a file (not implemented)
+    ///
+    /// # Arguments
+    /// * `path` - File path to load from
+    /// * `metric` - Distance metric to use
+    ///
+    /// # Returns
+    /// Loaded HNSW instance or error
     pub fn load(path: &str, metric: D) -> std::io::Result<Self> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -641,7 +765,7 @@ impl<D: DistanceMetric> HNSW<D> {
     }
 }
 
-/// Thread-safe concurrent HNSW index
+/// Thread-safe concurrent version of HNSW for multi-threaded access
 pub struct ConcurrentHNSW<D>
 where
     D: DistanceMetric + 'static + Send + Sync,
@@ -653,67 +777,83 @@ where
 }
 
 impl<D: DistanceMetric + 'static + Send + Sync> ConcurrentHNSW<D> {
-    /// Create a new concurrent HNSW instance
+    /// Creates a new concurrent HNSW from an existing HNSW instance
     pub fn new(hnsw: HNSW<D>) -> Self {
         let inner = Arc::new(RwLock::new(hnsw));
         let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let write_queue = Mutex::new(Vec::new());
+        let write_queue = Arc::new(Mutex::new(Vec::new()));
         let inner_clone = inner.clone();
         let stop_flag_clone = stop_flag.clone();
+        let write_queue_clone = write_queue.clone();
         let worker_handle = std::thread::spawn(move || {
-            Self::background_worker(inner_clone, stop_flag_clone);
+            Self::background_worker(inner_clone, stop_flag_clone, write_queue_clone);
         });
         Self {
             inner,
-            write_queue,
+            write_queue: Mutex::new(Vec::new()),
             worker_handle: Some(worker_handle),
             stop_flag,
         }
     }
 
+    /// Background worker thread that processes asynchronous insertions
     fn background_worker(
         inner: Arc<RwLock<HNSW<D>>>,
         stop_flag: Arc<std::sync::atomic::AtomicBool>,
+        write_queue: Arc<Mutex<Vec<Vec<f32>>>>,
     ) {
-        const BATCH_SIZE: usize = 100;
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(10));
+            let mut queue = write_queue.lock();
+            let remaining = BATCH_SIZE - batch.len();
+            if remaining > 0 && !queue.is_empty() {
+                let take_count = std::cmp::min(remaining, queue.len());
+                let taken = queue.drain(..take_count).collect::<Vec<_>>();
+                batch.extend(taken);
+            }
+            drop(queue);
             if batch.len() >= BATCH_SIZE {
                 let mut guard = inner.write();
                 guard.insert_batch(std::mem::take(&mut batch));
             }
         }
+        let mut queue = write_queue.lock();
+        if !batch.is_empty() {
+            let mut guard = inner.write();
+            guard.insert_batch(batch);
+        }
+        if !queue.is_empty() {
+            let mut guard = inner.write();
+            guard.insert_batch(std::mem::take(&mut queue));
+        }
     }
 
+    /// Searches for k nearest neighbors (thread-safe)
     pub fn search_knn(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
         let guard = self.inner.read();
         guard.search_knn(query, k)
     }
 
+    /// Searches for k nearest neighbors for multiple queries (thread-safe)
     pub fn search_knn_batch(&self, queries: &[Vec<f32>], k: usize) -> Vec<Vec<SearchResult>> {
-        let mut write_guard = self.inner.write();
-        write_guard.search_knn_batch(queries, k)
+        let mut guard = self.inner.write();
+        guard.search_knn_batch(queries, k)
     }
 
+    /// Asynchronously inserts a vector (adds to write queue for background processing)
     pub fn insert_async(&self, vector: Vec<f32>) {
         let mut queue = self.write_queue.lock();
         queue.push(vector);
-        if queue.len() >= 100 {
-            let batch = std::mem::take(&mut *queue);
-            let inner = self.inner.clone();
-            rayon::spawn(move || {
-                let mut guard = inner.write();
-                guard.insert_batch(batch);
-            });
-        }
     }
 
+    /// Returns statistics about the concurrent HNSW graph
     pub fn stats(&self) -> HnswStats {
         let guard = self.inner.read();
         guard.stats()
     }
 
+    /// Stops the background worker thread
     pub fn stop(&mut self) {
         self.stop_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);

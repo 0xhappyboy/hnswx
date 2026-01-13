@@ -14,7 +14,7 @@ impl FlatVecStorage {
     /// Create a new vector storage
     pub fn new(dim: usize, initial_capacity: usize) -> Self {
         Self {
-            data: Vec::with_capacity(dim * initial_capacity),
+            data: vec![0.0; dim * initial_capacity],
             dim,
             size: 0,
             free_slots: Vec::new(),
@@ -24,14 +24,20 @@ impl FlatVecStorage {
     /// Add a vector and return its ID
     pub fn add_vector(&mut self, vector: &[f32]) -> usize {
         let id = if let Some(id) = self.free_slots.pop() {
-            // Reuse deleted slot
             let offset = id * self.dim;
+            if offset + self.dim > self.data.len() {
+                self.data.resize(offset + self.dim, 0.0);
+            }
             self.data[offset..offset + self.dim].copy_from_slice(vector);
             id
         } else {
-            // Add new slot
             let id = self.size;
-            self.data.extend_from_slice(vector);
+            let required_len = (id + 1) * self.dim;
+            if required_len > self.data.len() {
+                self.data.resize(required_len, 0.0);
+            }
+            let offset = id * self.dim;
+            self.data[offset..offset + self.dim].copy_from_slice(vector);
             self.size += 1;
             id
         };
@@ -46,10 +52,15 @@ impl FlatVecStorage {
 
     /// Mark slot as free
     pub fn free_slot(&mut self, id: usize) {
+        if id >= self.size {
+            return;
+        }
         self.free_slots.push(id);
         let offset = id * self.dim;
-        for i in 0..self.dim {
-            self.data[offset + i] = 0.0;
+        if offset + self.dim <= self.data.len() {
+            for i in 0..self.dim {
+                self.data[offset + i] = 0.0;
+            }
         }
     }
 
